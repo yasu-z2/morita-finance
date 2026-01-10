@@ -1,134 +1,131 @@
-# coding: utf-8
 import yfinance as yf
 import pandas as pd
-import datetime
+from datetime import datetime
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
 
-# =====================
-# 設定
-# =====================
-TARGET_CODES_FILE = "tse_prime_codes.csv"  # ヘッダーなしCSV
-MAX_WORKERS = 5
-PRICE_LIMIT = 2000  # 株価上限
-PERIOD = "6mo"
+# ========= 設定 =========
+TARGET_CODES_FILE = "tse_prime_codes.csv"
+DAYS = 25
+PRICE_LIMIT = 2000
+SLEEP_SEC = 0.1   # Yahoo負荷対策
 
-# =====================
-# 安全なダウンロード（リトライ付き）
-# =====================
-def safe_download(ticker):
-    for _ in range(2):
-        try:
-            df = yf.download(
-                ticker,
-                period=PERIOD,
-                progress=False,
-                threads=False
-            )
-            return df
-        except Exception:
-            time.sleep(1)
-    return None
+# ========= ログ =========
+error_counts = {
+    "データ空（非上場・廃止・停止）": 0,
+    "カラム不足": 0,
+    "データ不足": 0,
+}
 
-# =====================
-# 個別銘柄チェック
-# =====================
+column_missing_records = []
+
+# ========= 判定関数 =========
 def check_stock(code):
     try:
-        df = safe_download(f"{code}.T")
+        df = yf.download(
+            code,
+            period="3mo",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
 
         if df is None or df.empty:
-            return None, "データ空（非上場・廃止・停止）"
+            error_counts["データ空（非上場・廃止・停止）"] += 1
+            return None
 
-        required_cols = {"Open", "High", "Low", "Close", "Volume"}
+        required_cols = {"Close", "Volume"}
         if not required_cols.issubset(df.columns):
-            return None, "カラム不足"
+            error_counts["カラム不足"] += 1
+            column_missing_records.append({
+                "code": code,
+                "missing_columns": list(required_cols - set(df.columns)),
+                "available_columns": list(df.columns)
+            })
+            return None
 
-        if len(df) < 25:
-            return None, "データ不足"
-
-        df = df.dropna()
-        if len(df) < 25:
-            return None, "NaN除外後不足"
+        df = df.tail(DAYS)
+        if len(df) < DAYS:
+            error_counts["データ不足"] += 1
+            return None
 
         close_today = float(df["Close"].iloc[-1])
         if close_today > PRICE_LIMIT:
-            return None, "株価2000円超"
+            return None
 
-        low_25 = df["Low"].iloc[-25:].min()
+        low_25 = float(df["Close"].min())
+        max_25 = float(df["Close"].max())
 
-        # 25日終値が底値±10%以内
-        close_25 = df["Close"].iloc[-25:]
-        if not close_25.between(low_25 * 0.9, low_25 * 1.1).all():
-            return None, None
+        if not (low_25 * 0.9 <= max_25 <= low_25 * 1.1):
+            return None
 
-        # 底値から10%以上上昇
         if close_today < low_25 * 1.1:
-            return None, None
+            return None
 
-        # 出来高条件
-        vol_avg = df["Volume"].iloc[-25:].mean()
+        vol_avg = float(df["Volume"].mean())
+        vol_last2 = df["Volume"].iloc[-2:]
+
         if not (
-            df["Volume"].iloc[-1] >= vol_avg * 2 and
-            df["Volume"].iloc[-2] >= vol_avg * 2
+            float(vol_last2.iloc[0]) >= vol_avg * 2 and
+            float(vol_last2.iloc[1]) >= vol_avg * 2
         ):
-            return None, None
+            return None
 
-        return code, None
+        return {
+            "code": code,
+            "close": round(close_today, 2),
+            "volume": int(vol_last2.iloc[-1])
+        }
 
     except Exception:
-        return None, "通信・APIエラー"
+        error_counts["データ空（非上場・廃止・停止）"] += 1
+        return None
 
-# =====================
-# メイン処理
-# =====================
+# ========= メイン =========
 def main():
-    start_time = datetime.datetime.now()
-    print(f"▶ 開始: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    start = datetime.now()
+    print(f"▶ 開始: {start.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # --- CSV前処理（対策②） ---
-    codes = (
-        pd.read_csv(TARGET_CODES_FILE, header=None)
-          .iloc[:, 0]
-          .astype(str)
-          .str.strip()
-    )
+    codes = pd.read_csv(TARGET_CODES_FILE, header=None)[0].astype(str).tolist()
+    codes = [c + ".T" if not c.endswith(".T") else c for c in codes]
 
-    codes = codes[
-        codes.str.fullmatch(r"\d{4}")
-    ].unique().tolist()
-
+    total = len(codes)
     results = []
-    error_counter = Counter()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(check_stock, code): code for code in codes}
+    for i, code in enumerate(codes, 1):
+        r = check_stock(code)
+        if r:
+            print(f"\nHIT: {r['code']}  終値={r['close']}")
+            results.append(r)
 
-        for future in as_completed(futures):
-            result, error = future.result()
+        # ---- 進捗表示 ----
+        elapsed = datetime.now() - start
+        percent = (i / total) * 100
+        print(
+            f"\r進捗: {i} / {total} ({percent:5.1f}%)  経過: {elapsed}",
+            end=""
+        )
 
-            if error:
-                error_counter[error] += 1
-            elif result:
-                results.append(result)
+        time.sleep(SLEEP_SEC)
 
-    end_time = datetime.datetime.now()
+    print()  # 改行
 
-    # =====================
-    # 結果表示
-    # =====================
-    print(f"\n▶ スクリーニング終了: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"⏱ 処理時間: {end_time - start_time}")
+    if column_missing_records:
+        pd.DataFrame(column_missing_records).to_csv(
+            "column_missing.csv",
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+    end = datetime.now()
+    print(f"\n▶ スクリーニング終了: {end.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⏱ 処理時間: {end - start}")
 
     print("\n--- 取得失敗・除外 内訳 ---")
-    for k, v in error_counter.items():
+    for k, v in error_counts.items():
         print(f"{k}: {v}")
 
     print(f"\n✅ ヒット銘柄数: {len(results)}")
-    if results:
-        print("ヒット銘柄:", ", ".join(results))
 
-# =====================
 if __name__ == "__main__":
     main()
