@@ -2,7 +2,7 @@ name: Stock Scanner v3.2.2
 
 on:
   schedule:
-    - cron: '15 13 * * *' # 日本時間 22:15
+    - cron: '20 13 * * *' # 日本時間 22:15
   workflow_dispatch:
 
 jobs:
