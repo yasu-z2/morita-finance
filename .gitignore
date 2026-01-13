@@ -1,8 +1,16 @@
 # レポートファイルを除外
 Report_*.csv
 Report_*.txt
+銘柄ローリスク部門.txt
 # 実行用バッチを除外
 run_scan.bat
+git.bat
 # Pythonのキャッシュを除外
 __pycache__/
 *.pyc
+# マニュアル類を除外
+【完全版】自動株価選別システム v1.11 運用マニュアル.txt
+【完全版】自動株価選別システム v1.11.zip
+#ディレクトリ除外
+OLD\
+tests\
