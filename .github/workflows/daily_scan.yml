@@ -1,8 +1,8 @@
-name: Stock Scanner v3.1.0
+name: Stock Scanner v3.2.0
 
 on:
   schedule:
-    - cron: '15 11 * * *'
+    - cron: '15 11 * * *' # 日本時間 20:15
   workflow_dispatch:
 
 jobs:
@@ -17,12 +17,12 @@ jobs:
         with:
           python-version: '3.10'
 
-      # --- キャッシュ設定 ---
+      # キャッシュ機能の有効化
       - name: Cache Stock Data
         uses: actions/cache@v3
         with:
           path: stock_cache.pkl
-          key: stock-data-${{ runner.os }}-${{ github.run_id }} # 毎日新しいキーで保存
+          key: stock-data-${{ runner.os }}-${{ hashFiles('**/scanner_ai.py') }}
           restore-keys: |
             stock-data-${{ runner.os }}-
 

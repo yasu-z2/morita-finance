@@ -1,6 +1,6 @@
 # ==========================================================
-# プログラム名: 株価選別システム (キャッシュ・差分更新・W分析版)
-# バージョン: 3.1.0 (スタンドアロン版ロジック完全統合)
+# プログラム名: 株価選別システム (v1.11ロジック + AI W分析)
+# バージョン: 3.2.0 (キャッシュ/差分更新/動的モデル選択)
 # 更新日: 2026-01-13
 # ==========================================================
 
@@ -16,108 +16,123 @@ from email.utils import formatdate
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
+# --- 設定定数 (v1.11 アルゴリズム準拠) ---
+WINDOW_DAYS = 25
+RANGE_FACTOR_S1 = 1.15
+UP_FROM_LOW_RATE = 1.10
+VOL_MULT_S1_TODAY = 2.0
+VOL_MULT_S1_YEST = 1.5
+PRICE_LIMIT_YEN = 200000
+CACHE_FILE = 'stock_cache.pkl'
+REQUEST_SLEEP = 0.1
+
 # --- 環境変数 ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 MAIL_ADDRESS   = os.environ.get('MAIL_ADDRESS')
 MAIL_PASSWORD  = os.environ.get('MAIL_PASSWORD')
 TO_ADDRESS     = os.environ.get('TO_ADDRESS')
 
-# --- 設定 ---
-CACHE_FILE = 'stock_cache.pkl'
-REQUEST_SLEEP = 0.1 # キャッシュ活用により少し短縮
-
 def call_gemini(prompt):
+    """利用可能なモデルを自動取得してAI分析を実行"""
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("models/gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        return response.text
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        target_model = next((m for m in models if 'gemini-1.5-flash' in m), models[0])
+        model = genai.GenerativeModel(target_model)
+        return model.generate_content(prompt).text
     except Exception as e:
         return f"AI分析エラー: {str(e)}"
 
-def run_scanner_v310():
+def run_scanner_final():
     start_time = time.time()
     jpx_csv = 'data_jpx.csv'
     df_full = pd.read_csv(jpx_csv, encoding='cp932')
     df_full['コード'] = df_full['コード'].astype(str).str.strip()
-    df_target = df_full[df_full['市場・商品区分'].str.contains('プライム')].copy()
-    codes = [f"{c}.T" for c in df_target['コード']]
+    df_prime = df_full[df_full['市場・商品区分'].str.contains('プライム') & df_full['市場・商品区分'].str.contains('内国株式')].copy()
+    codes = [f"{c}.T" for c in df_prime['コード']]
 
-    # キャッシュの読み込み
+    # キャッシュ読み込み
     all_history = {}
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'rb') as f:
-            all_history = pickle.load(f)
-        print(f">>> キャッシュを読み込みました ({len(all_history)}銘柄分)")
+        with open(CACHE_FILE, 'rb') as f: all_history = pickle.load(f)
 
     stage1_list = []
     print(f"--- スキャン開始 ({len(codes)}銘柄) ---")
 
     for code in tqdm(codes):
         try:
-            # 差分更新ロジック
+            # 差分更新または新規取得
             if code in all_history:
                 df = all_history[code]
-                last_date = df.index[-1]
-                # 最終データが昨日以前なら、今日分だけ取得して結合
-                if last_date.date() < datetime.now().date():
-                    new_data = yf.download(code, start=last_date + timedelta(days=1), progress=False)
+                if df.index[-1].date() < datetime.now().date():
+                    new_data = yf.download(code, start=df.index[-1] + timedelta(days=1), progress=False)
                     if not new_data.empty:
-                        df = pd.concat([df, new_data])
-                        df = df.tail(60) # 直近60日分に制限
+                        df = pd.concat([df, new_data]).tail(60)
                         all_history[code] = df
             else:
-                # 新規取得
                 df = yf.Ticker(code).history(period='40d')
                 all_history[code] = df
 
-            if len(df) < 20: continue
+            if len(df) < (WINDOW_DAYS + 1): continue
 
-            # --- スタンドアロン版と同一のロジック ---
-            curr_p = df['Close'].iloc[-1]
-            low_20 = df['Low'].iloc[-20:].min()
-            ratio_from_low = (curr_p / low_20 - 1) * 100
+            # --- v1.11 判定ロジック ---
+            df_window = df.iloc[-WINDOW_DAYS:]
+            low_window = df_window['Low'].min()
+            current_price = df_window['Close'].iloc[-1]
+            vol_avg = df_window['Volume'].mean()
+            vol_today = df_window['Volume'].iloc[-1]
+            vol_yesterday = df_window['Volume'].iloc[-2]
 
-            # 判定：安値から1%以上の立ち上がり
-            if ratio_from_low >= 1.0:
-                vol_ratio = df['Volume'].iloc[-1] / df['Volume'].iloc[-21:-1].mean()
-                ma25 = df['Close'].rolling(window=25).mean().iloc[-1]
-                dev25 = ((curr_p - ma25) / ma25) * 100
-                history_list = df['Close'].tail(5).apply(lambda x: f"{round(x,1)}").tolist()
+            is_range_s1 = df_window['Close'].iloc[:-3].max() <= (low_window * RANGE_FACTOR_S1)
+            up_from_low = current_price >= (low_window * UP_FROM_LOW_RATE)
+            high_vol_s1 = (vol_today >= vol_avg * VOL_MULT_S1_TODAY) and (vol_yesterday >= vol_avg * VOL_MULT_S1_YEST)
+
+            if is_range_s1 and up_from_low and high_vol_s1 and ((current_price * 100) <= PRICE_LIMIT_YEN):
+                # v1.11 指値計算
+                target1 = max(current_price * 0.97, df_window['Open'].iloc[-1])
+                target2 = (low_window + current_price) / 2
+                stop_loss = df['Close'].iloc[-5:].mean()
                 
                 pure_code = code.replace('.T', '')
-                name = df_full[df_full['コード'] == pure_code].iloc[0]['銘柄名']
-                
+                name_series = df_prime.loc[df_prime['コード'].astype(str) == pure_code, '銘柄名']
+                name = name_series.iloc[0] if not name_series.empty else 'N/A'
+
                 stage1_list.append({
-                    "コード": code, "名称": name, "終値": round(curr_p, 1),
-                    "安値比": round(ratio_from_low, 2), "出来高倍率": round(vol_ratio, 1),
-                    "25日乖離": round(dev25, 1), "5日推移": " -> ".join(history_list)
+                    "コード": code, "名称": name, "終値": round(current_price, 1),
+                    "上昇率": round(((current_price/low_window)-1)*100, 1),
+                    "第1指値": round(target1, 1), "第2指値": round(target2, 1),
+                    "損切目安": round(stop_loss, 1),
+                    "出来高倍率": round(vol_today/vol_avg, 1)
                 })
             time.sleep(REQUEST_SLEEP)
         except: continue
 
-    # キャッシュの保存
-    with open(CACHE_FILE, 'wb') as f:
-        pickle.dump(all_history, f)
+    # キャッシュ保存
+    with open(CACHE_FILE, 'wb') as f: pickle.dump(all_history, f)
 
     if not stage1_list:
         return
 
-    # --- 2段階AI分析 ---
-    top_picks = sorted(stage1_list, key=lambda x: x['安値比'], reverse=True)[:30]
+    # --- AI分析レポート作成 ---
+    top_picks = sorted(stage1_list, key=lambda x: x['出来高倍率'], reverse=True)[:15]
+    summary_data = "\n".join([f"- {s['名称']}({s['コード']}): 終値{s['終値']}円, 安値比+{s['上昇率']}%" for s in top_picks])
     
-    summary_text = "\n".join([f"- {s['名称']}({s['コード']}): 終値{s['終値']}, 安値比{s['安値比']}%" for s in top_picks])
-    analysis_1 = call_gemini(f"証券アナリストとして、以下の反発銘柄群を全体俯瞰して分析してください。\n{summary_text}")
-
-    detail_text = "\n".join([f"銘柄:{s['名称']}({s['コード']}), 終値:{s['終値']}, 出来高:{s['出来高倍率']}倍, 5日推移:{s['5日推移']}" for s in top_picks[:10]])
-    analysis_2 = call_gemini(f"以下の銘柄からプロの視点で「買い」のトップ3を選び、目標指値、損切ラインを提示してください。\n{detail_text}")
+    analysis_1 = call_gemini(f"プロの証券アナリストとして、以下の底値圏反発銘柄の市場背景を分析してください。\n{summary_data}")
+    
+    detail_data = "\n".join([f"{s['名称']}({s['コード']}): 終値{s['終値']}, 指値1:{s['第1指値']}, 指値2:{s['第2指値']}, 損切:{s['損切目安']}" for s in top_picks[:5]])
+    analysis_2 = call_gemini(f"以下の厳選銘柄に対して具体的な立ち回り戦略を作成してください。\n{detail_data}")
 
     # メール送信
     elapsed = round((time.time() - start_time) / 60, 1)
-    mail_body = f"■ 株価選別W分析レポート v3.1.0\n実行:{elapsed}分 / 抽出:{len(stage1_list)}件\n\n【全体分析】\n{analysis_1}\n\n【個別戦略】\n{analysis_2}"
+    mail_body = f"■ 株価選別W分析レポート v3.2.0\n実行時間: {elapsed}分 / ヒット数: {len(stage1_list)}件\n\n"
+    mail_body += "【第1段階：市場俯瞰】\n" + "="*40 + "\n" + analysis_1 + "\n\n"
+    mail_body += "【第2段階：投資アクション】\n" + "="*40 + "\n" + analysis_2
     
-    msg = MIMEText(mail_body)
-    msg['Subject'] = f"【AI分析】厳選レポート ({datetime.now().strftime('%m/%d')})"
+    send_report_email(f"【AI分析】本日の初動銘柄レポート ({len(stage1_list)}件)", mail_body)
+
+def send_report_email(subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
     msg['From'], msg['To'] = MAIL_ADDRESS, TO_ADDRESS
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
@@ -127,4 +142,4 @@ def run_scanner_v310():
     except: pass
 
 if __name__ == '__main__':
-    run_scanner_v310()
+    run_scanner_final()
