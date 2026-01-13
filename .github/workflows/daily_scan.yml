@@ -1,4 +1,4 @@
-name: Stock Scanner STEP2
+name: Stock Scanner fainal
 
 on:
   schedule:
