@@ -5,7 +5,7 @@ git init
 git add .
 
 :: 3. コミット（変更内容の記録）
-git commit -m "全機能統合・2段階AI選別版 (v3.0.4)"
+git commit -m "バージョン: 3.2.2 (複数宛先への一斉送信対応)"
 
 :: 4. メインブランチの名前を main に設定
 git branch -M main

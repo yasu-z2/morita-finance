@@ -1,6 +1,6 @@
 # ==========================================================
 # プログラム名: 株価選別システム (v1.11完全移植 + AI W分析)
-# バージョン: 3.2.1 (第二段階判定・該当なし表示対応)
+# バージョン: 3.2.2 (複数宛先への一斉送信対応)
 # 更新日: 2026-01-13
 # ==========================================================
 
@@ -149,18 +149,31 @@ def run_scanner_final_v321():
     mail_body += "【AI分析：市場俯瞰】\n" + "="*40 + "\n" + analysis_1 + "\n\n"
     mail_body += "【AI分析：投資戦略】\n" + "="*40 + "\n" + analysis_2
     
-    send_report_email(f"【AI分析】本日の初動銘柄レポート ({len(stage1_list)}件)", mail_body)
+send_report_email(f"【AI分析】本日の初動銘柄レポート ({len(stage1_list)}件)", mail_body)
 
 def send_report_email(subject, body):
+    if not TO_ADDRESS:
+        return
+
+    # カンマ区切りの文字列をリストに変換し、空白を除去
+    recipient_list = [addr.strip() for addr in TO_ADDRESS.split(',')]
+
     msg = MIMEText(body)
     msg['Subject'] = subject
-    msg['From'], msg['To'] = MAIL_ADDRESS, TO_ADDRESS
+    msg['From'] = MAIL_ADDRESS
+    # Toヘッダーにはカンマ区切りの文字列をセット
+    msg['To'] = ", ".join(recipient_list)
+    msg['Date'] = formatdate(localtime=True)
+
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
         server.login(MAIL_ADDRESS, MAIL_PASSWORD)
-        server.send_message(msg)
+        # 第2引数にリストを渡すことで、全員に送信されます
+        server.send_message(msg, to_addrs=recipient_list)
         server.close()
-    except: pass
+        print(f">>> {len(recipient_list)} 件の宛先へメールを送信しました。")
+    except Exception as e:
+        print(f">>> 送信失敗: {e}")
 
 if __name__ == '__main__':
-    run_scanner_final_v321()
+    run_scanner_final_v322()
