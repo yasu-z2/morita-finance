@@ -1,6 +1,6 @@
 # ==========================================================
 # プログラム名: 株価選別・AI分析システム
-# バージョン: 3.3.0 (調整案完全反映・スタンドアロン版ロジック統合)
+# バージョン: 3.3.1 (データ照合バグ修正・ロジック完全統合)
 # ==========================================================
 
 import os
@@ -17,14 +17,14 @@ from tqdm import tqdm
 
 # --- 調整案に基づく定数 ---
 WINDOW_DAYS = 25
-RANGE_FACTOR_S1 = 1.15      # 底値圏: +15%以内
-RANGE_FACTOR_S2 = 1.10      # 厳格モード: +10%以内
+RANGE_FACTOR_S1 = 1.15      # 第一段階: 底値15%以内
+RANGE_FACTOR_S2 = 1.10      # 第二段階: 底値10%以内
 UP_FROM_LOW_RATE = 1.10     # 初動: 25日安値から+10%以上
 VOL_MULT_S1_TODAY = 2.0     # 出来高: 当日2.0倍
 VOL_MULT_S1_YEST = 1.5      # 出来高: 前日1.5倍
 VOL_MULT_S2 = 2.0           # 厳格モード: 2日連続2.0倍
 
-# 環境変数・JST設定
+# 環境変数
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 MAIL_ADDRESS   = os.environ.get('MAIL_ADDRESS')
 MAIL_PASSWORD  = os.environ.get('MAIL_PASSWORD')
@@ -52,15 +52,22 @@ def send_report_email(subject, body):
         server.login(MAIL_ADDRESS, MAIL_PASSWORD)
         server.send_message(msg, to_addrs=recipient_list)
         server.close()
-    except Exception as e: print(f"送信エラー: {e}")
+    except Exception as e:
+        print(f"送信エラー: {e}")
 
 def run_scanner_final():
     jpx_csv = 'data_jpx.csv'
-    if not os.path.exists(jpx_csv): raise FileNotFoundError("data_jpx.csvが見つかりません。")
+    if not os.path.exists(jpx_csv):
+        raise FileNotFoundError("data_jpx.csvが見つかりません。")
 
+    # データ読み込み時の型を安定させる
     df_full = pd.read_csv(jpx_csv, encoding='cp932')
+    df_full['コード'] = df_full['コード'].astype(str).str.strip()
     df_prime = df_full[df_full['市場・商品区分'].str.contains('プライム')].copy()
-    codes = [f"{str(c).strip()}.T" for c in df_prime['コード']]
+    
+    # 銘柄名検索用の辞書を先に作成（高速化とエラー回避）
+    name_map = dict(zip(df_prime['コード'], df_prime['銘柄名']))
+    codes = [f"{c}.T" for c in name_map.keys()]
 
     stage1_list = []
     stage2_list = []
@@ -81,17 +88,15 @@ def run_scanner_final():
             vol_yest  = df_win['Volume'].iloc[-2]
             vol_avg   = df_win['Volume'].mean()
 
-            # --- 調整案ロジックの実装 ---
-            
-            # 1. 底値圏判定: 「5日前まで」の終値が安値から+15%以内か
-            # iloc[:-5] は最新5日分を除外した過去分
+            # --- ロジック判定 ---
+            # 1. 底値圏: 「5日前まで」の終値が安値から15%以内
             hist_close_max = df_win['Close'].iloc[:-5].max()
             is_bottom = hist_close_max <= (low_25d * RANGE_FACTOR_S1)
 
-            # 2. 初動判定: 25日安値から今日の終値が+10%以上か
+            # 2. 初動: 25日安値から+10%以上
             is_up = close_today >= (low_25d * UP_FROM_LOW_RATE)
 
-            # 3. 出来高判定: 今日2.0倍、昨日1.5倍
+            # 3. 出来高: 当日2.0倍、昨日1.5倍
             is_vol = (vol_today >= vol_avg * VOL_MULT_S1_TODAY) and (vol_yest >= vol_avg * VOL_MULT_S1_YEST)
 
             if is_bottom:
@@ -101,16 +106,26 @@ def run_scanner_final():
                     if is_vol:
                         stats["vol"] += 1
                         pure_code = code.replace('.T', '')
-                        name = df_prime.loc[df_prime['コード'] == int(pure_code), '銘柄名'].iloc[0]
-                        item = {"コード": pure_code, "名称": name, "終値": round(close_today, 1), "出来高倍": round(vol_today/vol_avg, 1)}
+                        # 辞書から安全に名称取得
+                        name = name_map.get(pure_code, "不明")
                         
-                        # 第二段階 (底値10%以内 且つ 2日連続2.0倍)
+                        item = {
+                            "コード": pure_code, 
+                            "名称": name, 
+                            "終値": round(close_today, 1), 
+                            "出来高倍": round(vol_today/vol_avg, 1)
+                        }
+                        
+                        # 第二段階判定
                         is_bottom_s2 = hist_close_max <= (low_25d * RANGE_FACTOR_S2)
                         is_vol_s2 = (vol_today >= vol_avg * VOL_MULT_S2) and (vol_yest >= vol_avg * VOL_MULT_S2)
                         if is_bottom_s2 and is_vol_s2:
                             stage2_list.append(item)
                         stage1_list.append(item)
-        except: continue
+        except Exception as e:
+            # 念のためエラー内容をコンソールに出力
+            print(f"Error skipping {code}: {e}")
+            continue
 
     # --- レポート作成 ---
     now_jst = datetime.now(JST)
@@ -134,12 +149,15 @@ def run_scanner_final():
         body += "・底値圏: 過去レンジが +10%以内\n"
         body += "・出来高: 2日連続で2.0倍以上 の急増を記録した最有力候補\n"
         body += "--------------------------------------------\n"
-        if not stage2_list: body += "（該当なし）\n"
+        if not stage2_list:
+            body += "（該当なし）\n"
         else:
             for i, m in enumerate(stage2_list, 1):
                 body += f"★ {m['コード']} {m['名称']} (終値:{m['終値']}円 / 出来高:{m['出来高倍']}倍)\n"
         
-        body += f"\n\n【AIによる市場概況・分析】\n{call_gemini(f'以下の銘柄リストの展望を分析して：{stage1_list}')}"
+        # AI分析
+        prompt = f"以下の銘柄リストは底値圏からの初動候補です。今後の展望を分析して：\n{stage1_list}"
+        body += f"\n\n【AIによる市場概況・分析】\n{call_gemini(prompt)}"
 
     send_report_email(subject, body)
 
