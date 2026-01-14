@@ -1,9 +1,11 @@
-name: Stock Scanner v3.2.0
+name: Daily Stock Scan (Mon-Fri)
 
 on:
   schedule:
-    - cron: '15 11 * * *' # 日本時間 20:15
-  workflow_dispatch:
+    # 日本時間 20:15 (UTC 11:15) に実行
+    # 分 時 日 月 曜日 (1-5 は 月-金)
+    - cron: '15 11 * * 1-5'
+  workflow_dispatch: # 手動実行ボタンも残しておきます
 
 jobs:
   build:
@@ -17,23 +19,30 @@ jobs:
         with:
           python-version: '3.10'
 
-      # キャッシュ機能の有効化
-      - name: Cache Stock Data
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas google-generativeai tqdm
+
+      - name: Restore cache
         uses: actions/cache@v3
         with:
           path: stock_cache.pkl
-          key: stock-data-${{ runner.os }}-${{ hashFiles('**/scanner_ai.py') }}
+          key: stock-data-${{ runner.os }}-${{ hashFiles('scanner_ai.py') }}
           restore-keys: |
             stock-data-${{ runner.os }}-
 
-      - name: Install dependencies
-        run: |
-          pip install pandas yfinance tqdm google-generativeai
-
-      - name: Run Script
+      - name: Run scanner
         env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MAIL_ADDRESS: ${{ secrets.MAIL_ADDRESS }}
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           TO_ADDRESS: ${{ secrets.TO_ADDRESS }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python scanner_ai.py
+
+      - name: Save cache
+        if: always()
+        uses: actions/cache/save@v3
+        with:
+          path: stock_cache.pkl
+          key: stock-data-${{ runner.os }}-${{ hashFiles('scanner_ai.py') }}-${{ github.run_id }}
