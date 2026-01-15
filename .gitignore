@@ -15,3 +15,5 @@ __pycache__/
 OLD\
 tests\
 .env
+stock_cache.pkl
+scanner_ai_b.py
