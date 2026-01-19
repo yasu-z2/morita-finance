@@ -184,7 +184,7 @@ def run_scanner_final():
             body += f"  Yahoo: https://finance.yahoo.co.jp/quote/{res['コード']}.T\n\n"
 
     # AI分析
-    prompt = f"以下の銘柄リストは底値圏からの初動候補です。背景を考慮し詳細に分析して：\n{stage1_list}"
+    prompt = f"あなたは決算書分析が得意なプロの投資アナリストです、必要なら具体的な決算数値を検索し以下の銘柄リストを背景を考慮し詳細に分析して：\n{stage1_list}"
     body += f"\n【AIによる市場概況・分析】\n{call_gemini(prompt)}"
 
     send_report_email(subject, body)
