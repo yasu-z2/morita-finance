@@ -1,6 +1,6 @@
 # ==========================================================
 # プログラム名: 株価選別・AI分析システム
-# バージョン: 3.7.2 (Gemini 2.5 Flash 固定・キャッシュロジック修正)
+# バージョン: 3.7.4 (v3.5.2 文言・ロジック完全厳守版)
 # ==========================================================
 
 import os
@@ -43,89 +43,75 @@ JST = timezone(timedelta(hours=+9), 'JST')
 def call_gemini_with_retry(prompt):
     if not GEMINI_API_KEY:
         return "AI分析を実行できませんでした。APIキーが設定されていません。"
-    
     client = genai.Client(api_key=GEMINI_API_KEY)
-    
     for attempt in range(3):
         try:
-            # モデルを gemini-2.5-flash に固定
-            response = client.models.generate_content(
-                model="gemini-2.5-flash", 
-                contents=prompt
-            )
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             return response.text
         except Exception as e:
             err_msg = str(e).lower()
             if ("503" in err_msg or "overloaded" in err_msg) and attempt < 2:
-                print(f"\n[AI] サーバー混雑中。15秒後に再試行します... ({attempt + 1}/3)")
                 time.sleep(15)
                 continue
             return f"AI分析を実行できませんでした。エラー詳細: {e}"
 
-# --- 3. メイン処理 ---
+# --- 3. メール送信関数 ---
+def send_report_email(subject, body):
+    if not TO_ADDRESS: return
+    recipient_list = [addr.strip() for addr in TO_ADDRESS.split(',')]
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = MAIL_ADDRESS
+    msg['To'] = ", ".join(recipient_list)
+    msg['Date'] = formatdate(localtime=True)
+    try:
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        server.login(MAIL_ADDRESS, MAIL_PASSWORD)
+        server.send_message(msg, to_addrs=recipient_list)
+        server.close()
+    except Exception as e:
+        print(f"メール送信エラー: {e}")
+
+# --- 4. メイン処理 ---
 def run_scanner_final():
     jpx_csv = 'data_jpx.csv'
-    if not os.path.exists(jpx_csv):
-        print(f"エラー: {jpx_csv} が見つかりません。")
-        return
+    if not os.path.exists(jpx_csv): return
 
     try:
         df_full = pd.read_csv(jpx_csv, encoding='cp932')
     except:
         df_full = pd.read_csv(jpx_csv, encoding='utf-8')
 
-    # 銘柄抽出（3.5.2のロジック維持）
     condition = df_full['市場・商品区分'].str.contains('プライム') & df_full['市場・商品区分'].str.contains('内国株式')
     df_prime = df_full[condition].copy()
     df_prime['コード'] = df_prime['コード'].astype(str).str.strip().str.replace('.0', '', regex=False)
     name_map = dict(zip(df_prime['コード'], df_prime['銘柄名']))
     codes = [f"{c}.T" for c in name_map.keys()]
 
-    # キャッシュのロードと有効期限チェック
     stock_data_cache = {}
-    valid_cache_count = 0
     now = datetime.now()
-
     if os.path.exists(CACHE_FILE):
         try:
-            with open(CACHE_FILE, 'rb') as f: 
-                loaded_cache = pickle.load(f)
-                # ファイル内の各銘柄のタイムスタンプをチェック
-                for c, val in loaded_cache.items():
-                    # val[1] が datetime オブジェクトであることを前提
-                    if (now - val[1]).total_seconds() < 3600:
-                        valid_cache_count += 1
-                stock_data_cache = loaded_cache
-        except Exception as e:
-            print(f"キャッシュロード失敗: {e}")
-
-    # 修正：正確な状況表示
-    print(f"【System】キャッシュファイルから {len(stock_data_cache)} 銘柄分を読み込みました。")
-    print(f"【System】そのうち有効期限内（1時間以内）のデータは {valid_cache_count} 銘柄です。")
-    print(f"スキャン開始 ({len(codes)} 銘柄対象)...")
+            with open(CACHE_FILE, 'rb') as f: stock_data_cache = pickle.load(f)
+        except: pass
 
     stage1_list = []
-    
+    stage2_list = []
+
     for code in tqdm(codes):
         try:
             df = None
-            # 1時間以内のキャッシュがある場合のみ利用
             if code in stock_data_cache:
                 last_df, last_time = stock_data_cache[code]
-                if (now - last_time).total_seconds() < 3600:
-                    df = last_df
+                if (now - last_time).total_seconds() < 3600: df = last_df
 
-            # キャッシュがない、または期限切れの場合はダウンロード
             if df is None:
                 time.sleep(REQUEST_SLEEP)
                 df = yf.Ticker(code).history(period=HISTORY_PERIOD)
-                if not df.empty:
-                    # 取得時刻とともにキャッシュを更新
-                    stock_data_cache[code] = (df, datetime.now())
+                if not df.empty: stock_data_cache[code] = (df, datetime.now())
 
             if df is None or len(df) < (WINDOW_DAYS + 1): continue
 
-            # --- ロジック判定 (v1.11) ---
             df_window = df.iloc[-WINDOW_DAYS:]
             low_window = df_window['Low'].min()
             current_price = df_window['Close'].iloc[-1]
@@ -133,38 +119,80 @@ def run_scanner_final():
             vol_today = df_window['Volume'].iloc[-1]
             vol_yesterday = df_window['Volume'].iloc[-2]
 
+            # --- 第一段階判定 ---
             is_range_s1 = df_window['Close'].iloc[:-3].max() <= (low_window * RANGE_FACTOR_S1)
             up_from_low = current_price >= (low_window * UP_FROM_LOW_RATE)
             high_vol_s1 = (vol_today >= vol_avg * VOL_MULT_S1_TODAY) and (vol_yesterday >= vol_avg * VOL_MULT_S1_YEST)
 
-            # 金額制限チェック
             if is_range_s1 and up_from_low and high_vol_s1 and ((current_price * 100) <= PRICE_LIMIT_YEN):
+                target1 = max(current_price * 0.97, df_window['Open'].iloc[-1])
+                target2 = (low_window + current_price) / 2
+                stop_loss = df['Close'].iloc[-5:].mean()
+                
                 pure_code = code.replace('.T','')
-                stage1_list.append({
-                    "名称": name_map.get(pure_code, 'N/A'),
-                    "コード": pure_code,
-                    "終値": round(current_price, 1),
-                    "上昇率": f"{round(((current_price/low_window)-1)*100, 1)}%"
-                })
+                item = {
+                    "コード": pure_code, "名称": name_map.get(pure_code, 'N/A'), "終値": round(current_price, 1),
+                    "上昇率": f"{round(((current_price/low_window)-1)*100, 1)}%",
+                    "第1指値": round(target1, 1), "第2指値": round(target2, 1),
+                    "損切目安": round(stop_loss, 1), "出来高倍率": round(vol_today/vol_avg, 1)
+                }
+
+                # --- 第二段階判定 (厳格ロジック) ---
+                # 条件: 底値圏 1.10倍以内 AND 2日連続で2.0倍以上の出来高
+                is_range_s2 = df_window['Close'].iloc[:-1].max() <= (low_window * RANGE_FACTOR_S2)
+                high_vol_s2 = (vol_today >= vol_avg * VOL_MULT_S2) and (vol_yesterday >= vol_avg * VOL_MULT_S2)
+                
+                if is_range_s2 and high_vol_s2:
+                    stage2_list.append(item)
+                
+                stage1_list.append(item)
         except: continue
 
-    # --- オートセーブ：AI分析直前に保存 ---
-    try:
-        with open(CACHE_FILE, 'wb') as f: 
-            pickle.dump(stock_data_cache, f)
-        print(f"\n[System] キャッシュ保存完了。最新の状態を保持しました。")
-    except Exception as e:
-        print(f"保存失敗: {e}")
+    # オートセーブ
+    with open(CACHE_FILE, 'wb') as f: pickle.dump(stock_data_cache, f)
 
-    # AI分析
-    if stage1_list:
-        print(f"該当 {len(stage1_list)} 銘柄を Gemini 2.5 Flash で分析中...")
-        prompt = f"プロの投資アナリストとして、以下の銘柄リストを詳細に分析してください：\n{stage1_list}"
-        report = call_gemini_with_retry(prompt)
-        print("\n=== AI分析レポート ===\n")
-        print(report)
+    # --- メール本文 (文言厳守) ---
+    now_jst = datetime.now(JST)
+    subject = f"【AI株式分析】本日のスクリーニングレポート該当{len(stage1_list)}件"
+    body = f"■ 実行日時(JST): {now_jst.strftime('%Y/%m/%d %H:%M')}\n"
+    body += f"■ スキャン銘柄数: {len(codes)}\n"
+    body += f"■ 採用ロジック: v1.11 (底値圏・初動リバウンド・出来高急増)\n"
+    body += f"■ AIモデル: Gemini 2.5 Flash\n\n"
+
+    body += "▼▼ 【第一段階：実戦モード】 注目候補 ▼▼\n"
+    body += "・底値圏: 過去25日安値から +15%以内\n"
+    body += "・初動: 当日終値が安値から +10%以上 上昇\n"
+    body += "・出来高: 当日2.0倍、前日1.5倍以上の急増\n"
+    body += "-" * 50 + "\n"
+    if not stage1_list: body += "該当なし\n\n"
     else:
-        print("該当銘柄なし。")
+        for res in stage1_list:
+            body += f"■ {res['名称']} ({res['コード']}.T)\n"
+            body += f"   終値: {res['終値']}円 (安値比 {res['上昇率']})\n"
+            body += f"   指値: [浅め] {res['第1指値']}円 / [本命] {res['第2指値']}円\n"
+            body += f"   損切: {res['損切目安']}円以下\n"
+            body += f"   Yahoo: https://finance.yahoo.co.jp/quote/{res['コード']}.T\n"
+            body += "-" * 40 + "\n"
+
+    body += "\n▼▼ 【第二段階：厳格モード】 特選初動候補 ▼▼\n"
+    body += "※注目候補の中からさらに厳選\n"
+    body += "・底値圏: 安値から +10%以内\n"
+    body += "・出来高: 2日連続で2.0倍以上 の急増を記録した最有力候補\n"
+    body += "-" * 50 + "\n"
+    if not stage2_list: body += "該当なし\n\n"
+    else:
+        for res in stage2_list:
+            body += f"★ {res['名称']} ({res['コード']}.T) - 出来高倍率: {res['出来高倍率']}倍\n"
+        body += "-" * 50 + "\n\n"
+
+    if stage1_list:
+        prompt = f"あなたは決算書分析が得意なプロの投資アナリストです、必要なら具体的な決算数値を検索し以下の銘柄リストを背景を考慮し詳細に分析してください：\n{stage1_list}"
+        body += f"【AIによる市場概況・詳細分析】\n" + "=" * 50 + f"\n{call_gemini_with_retry(prompt)}\n"
+    else:
+        body += "該当銘柄がないため、AI分析はスキップされました。\n"
+
+    send_report_email(subject, body)
+    print("完了")
 
 if __name__ == '__main__':
     run_scanner_final()
