@@ -1,16 +1,16 @@
 """
 AI Stock Scanner System
-Version: 3.6.6
+Version: 3.6.8
 Last Update: 2026-01-19
 
 【改修内容】
-1. v3.5.2 ベースの復元:
-   - 銘柄リストを 'data_jpx.csv' から読み込む安定した仕様に戻しました。
-2. オートセーブ機能の実装 (v3.6.0より継承):
-   - AI分析の実行直前に、取得済み株価データをキャッシュファイルへ保存。
-   - 万が一AIがエラーで止まっても、次回の再開時はダウンロードをスキップ可能。
-3. AI分析リトライ機能の実装 (v3.6.0より継承):
-   - 混雑エラー(503/Overloaded)時に15秒待機、最大3回まで自動再試行。
+1. v1.11 アルゴリズム固定定数への完全準拠:
+   - 定数名と値を指定通りに修正。
+   - 投資金額制限（PRICE_LIMIT_YEN = 200,000円）の条件を追加。
+2. 日本語文字コード・CSV読み込みの安定化:
+   - cp932/utf-8 の自動フォールバックと数値変換を実装。
+3. 堅牢性の維持:
+   - オートセーブ、AI分析リトライ機能を継続。
 """
 
 import os
@@ -23,23 +23,25 @@ from tqdm import tqdm
 from google import genai
 from dotenv import load_dotenv
 
-# --- 設定 ---
+# --- v1.11 アルゴリズム固定定数 (完全一致) ---
+HISTORY_PERIOD = '40d'        
+WINDOW_DAYS = 25              
+RANGE_FACTOR_S1 = 1.15        
+RANGE_FACTOR_S2 = 1.10        
+UP_FROM_LOW_RATE = 1.10       
+VOL_MULT_S1_TODAY = 2.0       
+VOL_MULT_S1_YEST = 1.5        
+VOL_MULT_S2 = 2.0             
+PRICE_LIMIT_YEN = 200000      
+REQUEST_SLEEP = 0.1           
+CACHE_FILE = 'stock_cache.pkl'
+JPX_CSV = 'data_jpx.csv'
+
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CACHE_FILE = "stock_cache.pkl"
-JPX_CSV = 'data_jpx.csv'  # v3.5.2 仕様の銘柄リストファイル
-REQUEST_SLEEP = 0.2 
-HISTORY_PERIOD = "40d"
-
-# --- ロジック定数 (v1.11) ---
-WINDOW_DAYS = 25
-PRICE_RATIO_NORMAL = 1.15
-REBOUND_RATIO = 1.10
-VOL_GROWTH_TODAY = 2.0
-VOL_GROWTH_YESTERDAY = 1.5
 
 def save_cache(data):
-    """キャッシュをファイルに保存する（AI分析前のオートセーブ用）"""
+    """AI分析前に株価データを保存"""
     try:
         with open(CACHE_FILE, 'wb') as f:
             pickle.dump(data, f)
@@ -48,7 +50,7 @@ def save_cache(data):
         print(f"キャッシュ保存エラー: {e}")
 
 def load_cache():
-    """キャッシュを読み込む"""
+    """キャッシュをロード"""
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'rb') as f:
@@ -58,25 +60,39 @@ def load_cache():
     return {}
 
 def check_stock_logic_v1_11(df):
-    """v1.11 判定ロジック"""
+    """v1.11 指定アルゴリズムに準拠した判定"""
     if df is None or len(df) < (WINDOW_DAYS + 1): return False
     
-    low_25 = df['Low'].rolling(window=WINDOW_DAYS).min().iloc[-1]
+    # 最新データの取得
     current_price = df['Close'].iloc[-1]
     day_low = df['Low'].iloc[-1]
     vol_today = df['Volume'].iloc[-1]
     vol_yesterday = df['Volume'].iloc[-2]
     vol_day_before = df['Volume'].iloc[-3]
+    
+    # 25日間安値
+    low_25 = df['Low'].rolling(window=WINDOW_DAYS).min().iloc[-1]
 
-    cond_bottom = (current_price / low_25) <= PRICE_RATIO_NORMAL
-    cond_rebound = (current_price / day_low) >= REBOUND_RATIO
-    cond_volume = (vol_today >= vol_yesterday * VOL_GROWTH_TODAY) and \
-                  (vol_yesterday >= vol_day_before * VOL_GROWTH_YESTERDAY)
+    # --- 判定開始 ---
+    
+    # 0. 投資金額制限 (100株で20万円以下)
+    if (current_price * 100) > PRICE_LIMIT_YEN:
+        return False
+
+    # 1. 底値圏判定 (RANGE_FACTOR_S1 = 1.15)
+    cond_bottom = (current_price / low_25) <= RANGE_FACTOR_S1
+    
+    # 2. リバウンド判定 (UP_FROM_LOW_RATE = 1.10)
+    cond_rebound = (current_price / day_low) >= UP_FROM_LOW_RATE
+    
+    # 3. 出来高判定 (TODAY >= YEST * 2.0 AND YEST >= DAY_BEFORE * 1.5)
+    cond_volume = (vol_today >= vol_yesterday * VOL_MULT_S1_TODAY) and \
+                  (vol_yesterday >= vol_day_before * VOL_MULT_S1_YEST)
 
     return cond_bottom and cond_rebound and cond_volume
 
 def analyze_with_ai_retry(stock_list):
-    """AI分析（リトライ機能付き）"""
+    """AI分析（503混雑時のリトライ機能付き）"""
     if not stock_list:
         return "本日は条件に合う銘柄はありませんでした。"
 
@@ -95,7 +111,6 @@ def analyze_with_ai_retry(stock_list):
 {stock_list}
 """
 
-    # --- ポイント：リトライループの実装 ---
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -106,23 +121,26 @@ def analyze_with_ai_retry(stock_list):
         except Exception as e:
             err_str = str(e).lower()
             if "503" in err_str or "overloaded" in err_str:
-                print(f"Geminiサーバー混雑中 ({attempt+1}/3). 15秒後に再試行...")
+                print(f"Gemini混雑中 ({attempt+1}/3). 15秒待機...")
                 time.sleep(15)
             else:
                 return f"AI分析エラー: {e}"
     
-    return "AI混雑のため分析をスキップしました。"
+    return "AI混雑のため、詳細分析を完了できませんでした。"
 
 def main():
-    # --- v3.5.2 仕様: CSVから銘柄リストを取得 ---
     if not os.path.exists(JPX_CSV):
         print(f"エラー: {JPX_CSV} が見つかりません。")
         return
 
-    df_jpx = pd.read_csv(JPX_CSV)
-    # v3.5.2 の列名に合わせて 'コード' または 'code' を指定してください
+    # 文字コード対応のCSVロード
+    try:
+        df_jpx = pd.read_csv(JPX_CSV, encoding='cp932')
+    except:
+        df_jpx = pd.read_csv(JPX_CSV, encoding='utf-8')
+
     col_name = 'コード' if 'コード' in df_jpx.columns else 'code'
-    codes = [f"{str(c)}.T" for c in df_jpx[col_name]]
+    codes = [f"{str(int(c))}.T" for c in df_jpx[col_name] if pd.notnull(c)]
     
     stock_data_cache = load_cache()
     print(f"【System】キャッシュから {len(stock_data_cache)} 銘柄ロード完了。")
@@ -133,7 +151,7 @@ def main():
     for code in tqdm(codes):
         try:
             df = None
-            # キャッシュ有効判定 (1時間 = 3600秒)
+            # キャッシュ有効判定
             if code in stock_data_cache:
                 last_df, last_time = stock_data_cache[code]
                 if (datetime.now() - last_time).total_seconds() < 3600:
@@ -146,23 +164,21 @@ def main():
                     continue 
                 stock_data_cache[code] = (df, datetime.now())
             
+            # ロジック判定 (金額制限含む)
             if check_stock_logic_v1_11(df):
                 stage1_found.append(code)
         except:
             continue
 
-    # --- ポイント：AI分析の直前に保存 ---
+    # AI分析前にオートセーブ
     save_cache(stock_data_cache)
 
     print(f"スクリーニング結果: {len(stage1_found)} 銘柄")
     
-    # AI分析 (リトライ機能付き)
     print("AI分析実行中...")
     report_text = analyze_with_ai_retry(stage1_found)
-    
     print("\n--- 分析レポート ---\n")
     print(report_text)
-    # 必要に応じてここに送信関数を追加：send_email(report_text)
 
 if __name__ == "__main__":
     main()
