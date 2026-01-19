@@ -2,7 +2,7 @@ name: Stock Scanner AI
 
 on:
   schedule:
-    - cron: '0 9 * * 1-5'  # 平日 18:00 JST
+    - cron: '05 7 * * 1-5'  # 平日 16:05 JST
   workflow_dispatch:        # 手動実行用
 
 jobs:
