@@ -17,3 +17,4 @@ __pycache__/
 .env
 stock_cache.pkl
 scanner_ai_b.py
+scanner_ai_c.py
