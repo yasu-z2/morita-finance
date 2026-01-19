@@ -145,3 +145,34 @@ def main():
             # 2. キャッシュがなければダウンロード
             if df is None:
                 time.sleep(REQUEST_SLEEP)
+                df = yf.Ticker(code).history(period=HISTORY_PERIOD)
+                
+                if df is None or df.empty:
+                    continue 
+                
+                # 取得成功時のみキャッシュに保存
+                stock_data_cache[code] = (df, datetime.now())
+            
+            # 3. 判定ロジック実行
+            if not df.empty and check_stock_logic_v1_11(df, strict=False):
+                stage1_found.append(code)
+                
+        except Exception:
+            continue
+
+    # --- 重要: AI分析の前にキャッシュをオートセーブ ---
+    save_cache(stock_data_cache)
+
+    print(f"スクリーニング合格: {len(stage1_found)} 銘柄")
+    
+    # 4. AI分析（リトライ機能付き）
+    print("プロ投資アナリストによる詳細分析を実行中...")
+    report_text = analyze_with_ai_retry(stage1_found)
+
+    # 5. メール送信（既存の関数 send_email が定義されている前提）
+    # send_email(report_text)
+    print(report_text) # デバッグ用出力
+    print("すべての工程が完了しました。")
+
+if __name__ == "__main__":
+    main()
