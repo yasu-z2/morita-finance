@@ -1,6 +1,6 @@
 # ==========================================================
 # プログラム名: 株価選別・AI分析システム
-# バージョン: 3.7.4 (v3.5.2 文言・ロジック完全厳守版)
+# バージョン: 3.7.5 (v3.5.2 文言・ロジック完全厳守 + 診断ログ追加版)
 # ==========================================================
 
 import os
@@ -75,7 +75,9 @@ def send_report_email(subject, body):
 # --- 4. メイン処理 ---
 def run_scanner_final():
     jpx_csv = 'data_jpx.csv'
-    if not os.path.exists(jpx_csv): return
+    if not os.path.exists(jpx_csv):
+        print(f"エラー: {jpx_csv} が見つかりません。")
+        return
 
     try:
         df_full = pd.read_csv(jpx_csv, encoding='cp932')
@@ -98,6 +100,11 @@ def run_scanner_final():
     stage1_list = []
     stage2_list = []
 
+    # --- 診断用カウンター ---
+    valid_data_count = 0
+    error_count = 0
+    first_error_msg = ""
+
     for code in tqdm(codes):
         try:
             df = None
@@ -111,6 +118,9 @@ def run_scanner_final():
                 if not df.empty: stock_data_cache[code] = (df, datetime.now())
 
             if df is None or len(df) < (WINDOW_DAYS + 1): continue
+
+            # データが正常に取得・検証できた数をカウント
+            valid_data_count += 1
 
             df_window = df.iloc[-WINDOW_DAYS:]
             low_window = df_window['Low'].min()
@@ -146,7 +156,16 @@ def run_scanner_final():
                     stage2_list.append(item)
                 
                 stage1_list.append(item)
-        except: continue
+        except Exception as e:
+            error_count += 1
+            if not first_error_msg:
+                first_error_msg = f"{code}: {e}"
+            continue
+
+    # --- 診断結果の出力 ---
+    print(f"\n【診断ログ】対象: {len(codes)}銘柄 / 正常データ取得: {valid_data_count}銘柄 / エラー: {error_count}件")
+    if first_error_msg:
+        print(f"【診断ログ】最初のエラー詳細: {first_error_msg}")
 
     # オートセーブ
     with open(CACHE_FILE, 'wb') as f: pickle.dump(stock_data_cache, f)
